@@ -1,4 +1,4 @@
-// server.js (SON GÜVENLİ VERSİYON - Dosya/Fotoğraf Desteği)
+// server.js (SHA-256 + Salt Auth + Şifreli Dosya Deposu)
 
 // Bu satır, MONGO_URI'yi .env dosyasından okur (Lokalde test için gereklidir)
 require('dotenv').config();
@@ -31,6 +31,7 @@ mongoose
 // --- MONGODB ŞEMALARI ---
 // 1. Kullanıcı Doğrulama Şeması (Authentication)
 const UserSchema = new mongoose.Schema({
+  fullName: { type: String, required: true },             // İSİM SOYİSİM
   username: { type: String, required: true, unique: true },
   salt: { type: String, required: true },
   hash: { type: String, required: true },
@@ -49,9 +50,8 @@ const NoteSchema = new mongoose.Schema({
 const Note = mongoose.model('Note', NoteSchema);
 
 // --- MIDDLEWARE ---
-// Artık daha büyük dosya yüklemelerini desteklemek için body-parser limitini artırıyoruz
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' })); // ÖNEMLİ: Dosya boyutu limitini artırdık
+app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
 // --- KRİPTOGRAFİK FONKSİYONLAR (SHA-256) ---
@@ -76,19 +76,32 @@ function verifyPassword(password, storedSalt, storedHash) {
 
 // 1. KAYIT ENDPOINT'i
 app.post('/register', async (req, res) => {
-  const { username, password } = req.body;
-  if (!username || !password)
-    return res.status(400).send({ message: 'Eksik bilgi.' });
+  const { fullName, username, password } = req.body;
+  if (!fullName || !username || !password) {
+    return res.status(400).send({ message: 'İsim, kullanıcı adı ve parola zorunludur.' });
+  }
+
+  if (username.length < 8) {
+    return res.status(400).send({ message: 'Kullanıcı adı en az 8 karakter olmalıdır.' });
+  }
+
+  // En az 1 küçük, 1 büyük, 1 sayı, 1 sembol, min 8 karakter
+  const strongPwRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
+  if (!strongPwRegex.test(password)) {
+    return res.status(400).send({
+      message: 'Parola en az 8 karakter olmalı; büyük harf, küçük harf, sayı ve sembol içermelidir.',
+    });
+  }
 
   try {
     const existingUser = await User.findOne({ username });
-    if (existingUser)
-      return res
-        .status(409)
-        .send({ message: 'Bu kullanıcı adı zaten kayıtlı.' });
+    if (existingUser) {
+      return res.status(409).send({ message: 'Bu kullanıcı adı zaten kayıtlı.' });
+    }
 
     const hashedData = hashPassword(password);
     const newUser = new User({
+      fullName,
       username,
       salt: hashedData.salt,
       hash: hashedData.hash,
@@ -120,11 +133,11 @@ app.post('/login', async (req, res) => {
 
     if (isPasswordValid) {
       console.log(`> GİRİŞ BAŞARILI: ${username}`);
-      // 🔥 ÖNEMLİ: Flutter tarafında AES anahtarını türetmek için salt da dönüyoruz
       return res.send({
         message: 'Giriş başarılı!',
         userId: user._id,
         salt: user.salt,
+        fullName: user.fullName,   // Flutter burada "Hoş geldiniz, İsim" gösterecek
       });
     } else {
       console.log(`> GİRİŞ HATASI: ${username}`);
@@ -151,11 +164,11 @@ app.post('/save_note', async (req, res) => {
 
   try {
     const newNote = new Note({
-      userId: userId,
-      encryptedContent: encryptedContent,
-      iv: iv,
-      contentType: contentType,
-      fileName: fileName,
+      userId,
+      encryptedContent,
+      iv,
+      contentType,
+      fileName,
     });
 
     await newNote.save();
@@ -175,11 +188,11 @@ app.get('/get_notes/:userId', async (req, res) => {
   const userId = req.params.userId;
 
   try {
-    const notes = await Note.find({ userId: userId }).select(
+    const notes = await Note.find({ userId }).select(
       'encryptedContent iv contentType fileName createdAt',
     );
 
-    res.status(200).send({ notes: notes });
+    res.status(200).send({ notes });
   } catch (e) {
     console.error(e);
     res
