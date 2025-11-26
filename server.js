@@ -1,206 +1,131 @@
-// server.js (SHA-256 + Salt Auth + Şifreli Dosya Deposu)
+// server.js (FINAL VERSION)
 
-// Bu satır, MONGO_URI'yi .env dosyasından okur (Lokalde test için gereklidir)
 require('dotenv').config();
-
 const express = require('express');
 const crypto = require('crypto');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const mongoose = require('mongoose');
+
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
-// GÜVENLİĞİN KALBİ: URI'yi gizli ortam değişkeninden çekiyoruz
-const MONGO_URI = process.env.MONGO_URI;
+// MongoDB Bağlantısı
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("MongoDB Bağlantısı Başarılı"))
+  .catch(err => { console.error(err); process.exit(1); });
 
-// --- MONGODB BAĞLANTISI ---
-if (!MONGO_URI) {
-  console.error("KRİTİK HATA: MONGO_URI ortam değişkeni okunamadı.");
-  process.exit(1);
-}
 
-mongoose
-  .connect(MONGO_URI)
-  .then(() => console.log('MongoDB Bağlantısı Başarılı. ✅'))
-  .catch((err) => {
-    console.error('MongoDB Bağlantı Hatası:', err);
-    process.exit(1);
-  });
-
-// --- MONGODB ŞEMALARI ---
-// 1. Kullanıcı Doğrulama Şeması (Authentication)
+// --- ŞEMALAR --- //
 const UserSchema = new mongoose.Schema({
-  fullName: { type: String, required: true },             // İSİM SOYİSİM
   username: { type: String, required: true, unique: true },
+  fullName: { type: String, required: true },
   salt: { type: String, required: true },
   hash: { type: String, required: true },
 });
-const User = mongoose.model('User', UserSchema);
+const User = mongoose.model("User", UserSchema);
 
-// 2. Güvenli Not/Veri Saklama Şeması (Encryption)
 const NoteSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  encryptedContent: { type: String, required: true }, // Şifreli içerik (Metin veya Base64 Dosya Verisi)
-  iv: { type: String, required: true },               // Şifre çözme vektörü
-  contentType: { type: String, required: true },      // VERİ TÜRÜ (text, image/png, application/pdf vb.)
-  fileName: { type: String },                         // Opsiyonel: Dosya adı
+  encryptedContent: { type: String, required: true },
+  iv: { type: String, required: true },
+  contentType: { type: String, required: true },
+  fileName: { type: String },
   createdAt: { type: Date, default: Date.now },
 });
-const Note = mongoose.model('Note', NoteSchema);
+const Note = mongoose.model("Note", NoteSchema);
 
-// --- MIDDLEWARE ---
+
+// --- MIDDLEWARE --- //
 app.use(cors());
-app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
+app.use(bodyParser.json({ limit: "100mb" }));
+app.use(bodyParser.urlencoded({ limit: "100mb", extended: true }));
 
-// --- KRİPTOGRAFİK FONKSİYONLAR (SHA-256) ---
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto
-    .createHash('sha256')
+
+// --- KRİPTO FONKSİYONLARI --- //
+function hashPassword(password, salt = null) {
+  salt = salt || crypto.randomBytes(16).toString("hex");
+  const hash = crypto.createHash("sha256")
     .update(password + salt)
-    .digest('hex');
+    .digest("hex");
   return { salt, hash };
 }
 
-function verifyPassword(password, storedSalt, storedHash) {
-  const newHash = crypto
-    .createHash('sha256')
-    .update(password + storedSalt)
-    .digest('hex');
-  return newHash === storedHash;
-}
+// --- ENDPOINTLER --- //
 
-// --- API ENDPOINT'LERİ ---
+// Kayıt
+app.post("/register", async (req, res) => {
+  const { username, password, fullName } = req.body;
+  if (!username || !password || !fullName)
+    return res.status(400).send({ message: "Eksik alanlar var." });
 
-// 1. KAYIT ENDPOINT'i
-app.post('/register', async (req, res) => {
-  const { fullName, username, password } = req.body;
-  if (!fullName || !username || !password) {
-    return res.status(400).send({ message: 'İsim, kullanıcı adı ve parola zorunludur.' });
-  }
+  const exists = await User.findOne({ username });
+  if (exists)
+    return res.status(409).send({ message: "Kullanıcı adı mevcut." });
 
-  if (username.length < 8) {
-    return res.status(400).send({ message: 'Kullanıcı adı en az 8 karakter olmalıdır.' });
-  }
+  const { salt, hash } = hashPassword(password);
+  await new User({ username, fullName, salt, hash }).save();
 
-  // En az 1 küçük, 1 büyük, 1 sayı, 1 sembol, min 8 karakter
-  const strongPwRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/;
-  if (!strongPwRegex.test(password)) {
-    return res.status(400).send({
-      message: 'Parola en az 8 karakter olmalı; büyük harf, küçük harf, sayı ve sembol içermelidir.',
-    });
-  }
-
-  try {
-    const existingUser = await User.findOne({ username });
-    if (existingUser) {
-      return res.status(409).send({ message: 'Bu kullanıcı adı zaten kayıtlı.' });
-    }
-
-    const hashedData = hashPassword(password);
-    const newUser = new User({
-      fullName,
-      username,
-      salt: hashedData.salt,
-      hash: hashedData.hash,
-    });
-
-    await newUser.save();
-    res.status(201).send({ message: 'Kayıt başarılı.' });
-  } catch (e) {
-    console.error(e);
-    res.status(500).send({ message: 'Sunucu hatası.' });
-  }
+  res.status(201).send({ message: "Kayıt başarılı!" });
 });
 
-// 2. GİRİŞ ENDPOINT'i
-app.post('/login', async (req, res) => {
+// Giriş
+app.post("/login", async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password)
-    return res.status(400).send({ message: 'Eksik bilgi.' });
+  const user = await User.findOne({ username });
 
-  try {
-    const user = await User.findOne({ username });
+  if (!user) return res.status(401).send({ message: "Hatalı bilgiler." });
 
-    if (!user)
-      return res
-        .status(401)
-        .send({ message: 'Kullanıcı adı veya parola hatalı.' });
+  const { hash } = hashPassword(password, user.salt);
+  if (hash !== user.hash)
+    return res.status(401).send({ message: "Hatalı bilgiler." });
 
-    const isPasswordValid = verifyPassword(password, user.salt, user.hash);
-
-    if (isPasswordValid) {
-      console.log(`> GİRİŞ BAŞARILI: ${username}`);
-      return res.send({
-        message: 'Giriş başarılı!',
-        userId: user._id,
-        salt: user.salt,
-        fullName: user.fullName,   // Flutter burada "Hoş geldiniz, İsim" gösterecek
-      });
-    } else {
-      console.log(`> GİRİŞ HATASI: ${username}`);
-      return res
-        .status(401)
-        .send({ message: 'Kullanıcı adı veya parola hatalı.' });
-    }
-  } catch (e) {
-    console.error(e);
-    res.status(500).send({ message: 'Sunucu hatası.' });
-  }
+  res.send({
+    message: "Giriş başarılı",
+    userId: user._id,
+    fullName: user.fullName,
+    salt: user.salt,
+  });
 });
 
-// 3. NOT/VERİ KAYDETME ENDPOINT'i
-app.post('/save_note', async (req, res) => {
+// Veri / Dosya Yükleme
+app.post("/save_note", async (req, res) => {
   const { userId, encryptedContent, iv, contentType, fileName } = req.body;
+  if (!userId || !encryptedContent || !iv || !contentType)
+    return res.status(400).send({ message: "Eksik veri" });
 
-  if (!userId || !encryptedContent || !iv || !contentType) {
-    return res.status(400).send({
-      message:
-        'Eksik veri: Kullanıcı ID, şifreli içerik, IV ve içerik türü gereklidir.',
-    });
-  }
-
-  try {
-    const newNote = new Note({
-      userId,
-      encryptedContent,
-      iv,
-      contentType,
-      fileName,
-    });
-
-    await newNote.save();
-    res.status(201).send({
-      message: 'Veriniz güvenli bir şekilde şifreli olarak kaydedildi.',
-    });
-  } catch (e) {
-    console.error('Veri Kaydetme Hatası:', e);
-    res
-      .status(500)
-      .send({ message: 'Sunucu, veriyi kaydederken hata oluştu.' });
-  }
+  await new Note({ userId, encryptedContent, iv, contentType, fileName }).save();
+  res.status(201).send({ message: "Kaydedildi" });
 });
 
-// 4. NOTLARI/VERİLERİ ÇEKME ENDPOINT'i
-app.get('/get_notes/:userId', async (req, res) => {
-  const userId = req.params.userId;
-
-  try {
-    const notes = await Note.find({ userId }).select(
-      'encryptedContent iv contentType fileName createdAt',
-    );
-
-    res.status(200).send({ notes });
-  } catch (e) {
-    console.error(e);
-    res
-      .status(500)
-      .send({ message: 'Sunucu, verileri çekerken hata oluştu.' });
-  }
+// Veri Listeleme
+app.get("/get_notes/:userId", async (req, res) => {
+  const notes = await Note.find({ userId: req.params.userId }).sort({ createdAt: -1 });
+  res.send({ notes });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server çalışıyor: http://localhost:${PORT}`);
+// Veri Silme
+app.delete("/delete_note/:id", async (req, res) => {
+  await Note.findByIdAndDelete(req.params.id);
+  res.send({ message: "Silindi" });
 });
+
+// Şifre Değiştirme
+app.post("/change_password", async (req, res) => {
+  const { userId, oldPassword, newPassword } = req.body;
+  const user = await User.findById(userId);
+
+  const { hash } = hashPassword(oldPassword, user.salt);
+  if (hash !== user.hash)
+    return res.status(403).send({ message: "Eski şifre hatalı" });
+
+  const newHashed = hashPassword(newPassword);
+  user.hash = newHashed.hash;
+  user.salt = newHashed.salt;
+  await user.save();
+
+  res.send({ message: "Şifre güncellendi." });
+});
+
+// Sunucu başlat
+app.listen(PORT, () => console.log("Server Running → " + PORT));
