@@ -1,15 +1,44 @@
-// server.js (FINAL, FRONTEND İLE UYUMLU)
-
+// server.js
 require('dotenv').config();
 const express = require('express');
+const mongoose = require('mongoose');
 const crypto = require('crypto');
 const cors = require('cors');
-const mongoose = require('mongoose');
+const bodyParser = require('body-parser');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-// ----------------- MONGODB BAĞLANTISI -----------------
+app.use(express.json({ limit: '100mb' }));
+app.use(bodyParser.json({ limit: '100mb' }));
+app.use(cors());
+
+// HTTP + Socket.io
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*', // istersen buraya frontend domain'ini koy
+    methods: ['GET', 'POST', 'DELETE', 'PUT'],
+  },
+});
+
+// Socket bağlantısı
+io.on('connection', (socket) => {
+  console.log('🔌 Yeni bir client bağlandı:', socket.id);
+
+  socket.on('join', (userId) => {
+    if (!userId) return;
+    socket.join(userId);
+    console.log(`🟢 Kullanıcı odaya katıldı: userId=${userId}`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('❌ Client bağlantısı koptu:', socket.id);
+  });
+});
+
+// MongoDB
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => console.log('✅ MongoDB bağlantısı başarılı'))
@@ -18,7 +47,7 @@ mongoose
     process.exit(1);
   });
 
-// ----------------- ŞEMALAR -----------------
+// User şeması
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   fullName: { type: String, required: true },
@@ -28,24 +57,24 @@ const UserSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', UserSchema);
 
+// Note şeması
 const NoteSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   encryptedContent: { type: String, required: true },
   iv: { type: String, required: true },
   contentType: { type: String, required: true }, // image / video / pdf / text
   fileName: { type: String },
-  label: { type: String, default: null },        // not etiketleri: İş / Okul / ...
+  label: { type: String, default: null },
   createdAt: { type: Date, default: Date.now },
+
+  // paylaşım için
+  sharedFrom: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // başka kullanıcıdan geldiyse
+  shareCode: { type: String, default: null }, // herkese açık kod
 });
 
 const Note = mongoose.model('Note', NoteSchema);
 
-// ----------------- MIDDLEWARE -----------------
-app.use(cors());
-app.use(express.json({ limit: '100mb' }));
-app.use(express.urlencoded({ limit: '100mb', extended: true }));
-
-// ----------------- KRİPTO FONKSİYONU -----------------
+// Şifre hash fonksiyonu
 function hashPassword(password, salt = null) {
   salt = salt || crypto.randomBytes(16).toString('hex');
   const hash = crypto
@@ -55,7 +84,7 @@ function hashPassword(password, salt = null) {
   return { salt, hash };
 }
 
-// ----------------- ENDPOINTLER -----------------
+// ----------------- AUTH -----------------
 
 // Kayıt
 app.post('/register', async (req, res) => {
@@ -63,21 +92,29 @@ app.post('/register', async (req, res) => {
     const { username, password, fullName } = req.body;
 
     if (!username || !password || !fullName) {
-      return res.status(400).send({ message: 'Eksik alanlar var.' });
+      return res.status(400).send({ message: 'Tüm alanlar zorunludur' });
     }
 
-    const exists = await User.findOne({ username });
-    if (exists) {
-      return res.status(409).send({ message: 'Kullanıcı adı mevcut.' });
+    const existingUser = await User.findOne({ username });
+    if (existingUser) {
+      return res.status(409).send({ message: 'Bu kullanıcı adı zaten kayıtlı' });
     }
 
     const { salt, hash } = hashPassword(password);
-    await new User({ username, fullName, salt, hash }).save();
 
-    res.status(201).send({ message: 'Kayıt başarılı!' });
+    const user = new User({
+      username,
+      fullName,
+      salt,
+      hash,
+    });
+
+    await user.save();
+
+    res.status(201).send({ message: 'Kayıt başarılı' });
   } catch (err) {
-    console.error('register error:', err);
-    res.status(500).send({ message: 'Sunucu hatası.' });
+    console.error('Kayıt hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
 
@@ -85,18 +122,19 @@ app.post('/register', async (req, res) => {
 app.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
+
     if (!username || !password) {
-      return res.status(400).send({ message: 'Eksik alanlar var.' });
+      return res.status(400).send({ message: 'Tüm alanlar zorunludur' });
     }
 
     const user = await User.findOne({ username });
     if (!user) {
-      return res.status(401).send({ message: 'Hatalı bilgiler.' });
+      return res.status(401).send({ message: 'Kullanıcı bulunamadı' });
     }
 
     const { hash } = hashPassword(password, user.salt);
     if (hash !== user.hash) {
-      return res.status(401).send({ message: 'Hatalı bilgiler.' });
+      return res.status(401).send({ message: 'Şifre hatalı' });
     }
 
     res.send({
@@ -106,25 +144,74 @@ app.post('/login', async (req, res) => {
       salt: user.salt,
     });
   } catch (err) {
-    console.error('login error:', err);
-    res.status(500).send({ message: 'Sunucu hatası.' });
+    console.error('Giriş hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
 
-// Veri / Dosya Yükleme
+// Şifre değiştirme
+app.post('/change_password', async (req, res) => {
+  try {
+    const { userId, oldPassword, newPassword } = req.body;
+
+    if (!userId || !oldPassword || !newPassword) {
+      return res.status(400).send({ message: 'Tüm alanlar zorunludur' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).send({ message: 'Kullanıcı bulunamadı' });
+    }
+
+    const { hash: oldHash } = hashPassword(oldPassword, user.salt);
+    if (oldHash !== user.hash) {
+      return res.status(401).send({ message: 'Eski şifre hatalı' });
+    }
+
+    const { salt, hash } = hashPassword(newPassword);
+    user.salt = salt;
+    user.hash = hash;
+    await user.save();
+
+    res.send({ message: 'Şifre başarıyla değiştirildi' });
+  } catch (err) {
+    console.error('Şifre değiştirme hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
+  }
+});
+
+// Hesap silme
+app.delete('/delete_account/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).send({ message: 'Kullanıcı bulunamadı' });
+    }
+
+    await Note.deleteMany({ userId });
+    await User.findByIdAndDelete(userId);
+
+    io.to(userId.toString()).emit('account_deleted');
+
+    res.send({ message: 'Hesap ve tüm notlar silindi' });
+  } catch (err) {
+    console.error('Hesap silme hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
+  }
+});
+
+// ----------------- NOT / DOSYA -----------------
+
+// Not kaydetme
 app.post('/save_note', async (req, res) => {
   try {
-    const {
-      userId,
-      encryptedContent,
-      iv,
-      contentType,
-      fileName,
-      label, // opsiyonel
-    } = req.body;
+    const { userId, encryptedContent, iv, contentType, fileName, label } =
+      req.body;
 
     if (!userId || !encryptedContent || !iv || !contentType) {
-      return res.status(400).send({ message: 'Eksik veri.' });
+      return res.status(400).send({ message: 'Zorunlu alanlar eksik' });
     }
 
     const note = new Note({
@@ -133,107 +220,176 @@ app.post('/save_note', async (req, res) => {
       iv,
       contentType,
       fileName,
-      label: label || null,
+      label,
     });
 
     await note.save();
-    res.status(201).send({ message: 'Kaydedildi', noteId: note._id });
+
+    io.to(userId.toString()).emit('notes_updated');
+
+    res.status(201).send({ message: 'Not kaydedildi', noteId: note._id });
   } catch (err) {
-    console.error('save_note error:', err);
-    res.status(500).send({ message: 'Sunucu hatası.' });
+    console.error('Not kaydetme hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
 
-// Veri Listeleme (isteğe bağlı sayfalama)
+// Notları listeleme
 app.get('/get_notes/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
+    let { page = 1, limit = 1000 } = req.query;
 
-    // ?page=1&limit=20 gibi kullanabilirsin
-    const page = parseInt(req.query.page || '1', 10);
-    const limit = parseInt(req.query.limit || '1000', 10); // frontend şu an limit göndermiyor
-    const skip = (page - 1) * limit;
+    page = parseInt(page);
+    limit = parseInt(limit);
 
-    const [notes, total] = await Promise.all([
-      Note.find({ userId }).sort({ createdAt: -1 }).skip(skip).limit(limit),
-      Note.countDocuments({ userId }),
-    ]);
+    const notes = await Note.find({ userId })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit);
 
-    const totalPages = Math.ceil(total / limit);
+    const total = await Note.countDocuments({ userId });
 
-    res.send({ notes, page, totalPages, total });
+    res.send({
+      notes,
+      total,
+      page,
+      limit,
+    });
   } catch (err) {
-    console.error('get_notes error:', err);
-    res.status(500).send({ message: 'Sunucu hatası.' });
+    console.error('Notları listeleme hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
 
-// Veri Silme
+// Not silme
 app.delete('/delete_note/:id', async (req, res) => {
   try {
     const { id } = req.params;
+
     const deleted = await Note.findByIdAndDelete(id);
     if (!deleted) {
+      return res.status(404).send({ message: 'Not bulunamadı' });
+    }
+
+    io.to(deleted.userId.toString()).emit('notes_updated');
+
+    res.send({ message: 'Not silindi' });
+  } catch (err) {
+    console.error('Not silme hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
+  }
+});
+
+// ----------------- PAYLAŞIM -----------------
+
+// Not paylaşma (kullanıcıya veya herkese açık kod)
+app.post('/share_note', async (req, res) => {
+  try {
+    const { fromUserId, noteId, mode, targetUsername } = req.body;
+
+    if (!fromUserId || !noteId || !mode) {
+      return res
+        .status(400)
+        .send({ message: 'fromUserId, noteId ve mode zorunlu.' });
+    }
+
+    const fromUser = await User.findById(fromUserId);
+    if (!fromUser) {
+      return res
+        .status(404)
+        .send({ message: 'Gönderen kullanıcı bulunamadı.' });
+    }
+
+    const note = await Note.findOne({ _id: noteId, userId: fromUserId });
+    if (!note) {
       return res.status(404).send({ message: 'Not bulunamadı.' });
     }
-    res.send({ message: 'Silindi' });
+
+    if (mode === 'direct') {
+      if (!targetUsername) {
+        return res
+          .status(400)
+          .send({ message: 'targetUsername zorunlu (direct mod).' });
+      }
+
+      const targetUser = await User.findOne({ username: targetUsername });
+      if (!targetUser) {
+        return res
+          .status(404)
+          .send({ message: 'Hedef kullanıcı bulunamadı.' });
+      }
+
+      const newNote = new Note({
+        userId: targetUser._id,
+        encryptedContent: note.encryptedContent,
+        iv: note.iv,
+        contentType: note.contentType,
+        fileName: note.fileName,
+        label: note.label,
+        sharedFrom: fromUser._id,
+      });
+
+      await newNote.save();
+
+      io.to(targetUser._id.toString()).emit('notes_updated');
+
+      return res.status(201).send({ message: 'Dosya kullanıcıya gönderildi.' });
+    }
+
+    if (mode === 'public') {
+      const code = crypto.randomBytes(4).toString('hex'); // 8 karakter
+      note.shareCode = code;
+      await note.save();
+
+      return res.status(200).send({
+        message: 'Paylaşım kodu oluşturuldu.',
+        code,
+      });
+    }
+
+    return res.status(400).send({ message: 'Geçersiz mode.' });
   } catch (err) {
-    console.error('delete_note error:', err);
-    res.status(500).send({ message: 'Sunucu hatası.' });
+    console.error('Paylaşım hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
 
-// Şifre Değiştirme
-app.post('/change_password', async (req, res) => {
+// Kod ile paylaşılan notu bulma
+app.get('/search_shared/:code', async (req, res) => {
   try {
-    const { userId, oldPassword, newPassword } = req.body;
-    if (!userId || !oldPassword || !newPassword) {
-      return res.status(400).send({ message: 'Eksik alanlar var.' });
+    const { code } = req.params;
+
+    if (!code) {
+      return res.status(400).send({ message: 'Kod zorunlu.' });
     }
 
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).send({ message: 'Kullanıcı bulunamadı.' });
+    const note = await Note.findOne({ shareCode: code });
+    if (!note) {
+      return res.status(404).send({ message: 'Bu koda ait paylaşım yok.' });
     }
 
-    const { hash: oldHash } = hashPassword(oldPassword, user.salt);
-    if (oldHash !== user.hash) {
-      return res.status(403).send({ message: 'Eski şifre hatalı.' });
-    }
-
-    const { salt, hash } = hashPassword(newPassword);
-    user.salt = salt;
-    user.hash = hash;
-    await user.save();
-
-    res.send({ message: 'Şifre güncellendi.' });
+    res.send({
+      note: {
+        _id: note._id,
+        userId: note.userId,
+        encryptedContent: note.encryptedContent,
+        iv: note.iv,
+        contentType: note.contentType,
+        fileName: note.fileName,
+        label: note.label,
+        createdAt: note.createdAt,
+      },
+    });
   } catch (err) {
-    console.error('change_password error:', err);
-    res.status(500).send({ message: 'Sunucu hatası.' });
+    console.error('Kod ile arama hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
 
-// Hesabı Kalıcı Olarak Sil (kullanıcı + tüm notlar)
-app.delete('/delete_account/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
+// ----------------- SUNUCU -----------------
 
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).send({ message: 'Kullanıcı bulunamadı.' });
-    }
-
-    await Note.deleteMany({ userId });
-    await User.deleteOne({ _id: userId });
-
-    res.send({ message: 'Kullanıcı ve tüm notlar silindi.' });
-  } catch (err) {
-    console.error('delete_account error:', err);
-    res.status(500).send({ message: 'Sunucu hatası.' });
-  }
-});
-
-// ----------------- SUNUCU BAŞLAT -----------------
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`🚀 Sunucu çalışıyor: http://localhost:${PORT}`);
 });
