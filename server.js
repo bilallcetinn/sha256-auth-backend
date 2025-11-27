@@ -18,7 +18,7 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*', // istersen buraya frontend domain'ini koy
+    origin: '*',
     methods: ['GET', 'POST', 'DELETE', 'PUT'],
   },
 });
@@ -47,6 +47,8 @@ mongoose
     process.exit(1);
   });
 
+// ----------------- MODELLER -----------------
+
 // User şeması
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
@@ -57,7 +59,7 @@ const UserSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', UserSchema);
 
-// Note şeması
+// Note şeması (kasa için)
 const NoteSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   encryptedContent: { type: String, required: true },
@@ -67,14 +69,31 @@ const NoteSchema = new mongoose.Schema({
   label: { type: String, default: null },
   createdAt: { type: Date, default: Date.now },
 
-  // paylaşım için
-  sharedFrom: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // başka kullanıcıdan geldiyse
-  shareCode: { type: String, default: null }, // herkese açık kod
+  // eski paylaşım denemelerinden kalmış olabilir, dursun zararı yok
+  sharedFrom: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  shareCode: { type: String, default: null },
 });
 
 const Note = mongoose.model('Note', NoteSchema);
 
-// Şifre hash fonksiyonu
+// Paylaşım için ayrı model (kasa dışı)
+const SharedFileSchema = new mongoose.Schema({
+  fromUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  toUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // direct ise dolu
+  mode: { type: String, enum: ['direct', 'code'], required: true },
+
+  shareCode: { type: String, default: null }, // code modunda kullanılacak kod
+  encryptedContent: { type: String, required: true }, // shareKey ile şifrelenmiş base64
+  iv: { type: String, required: true },
+  contentType: { type: String, required: true }, // image / video / pdf / file
+  fileName: { type: String },
+  createdAt: { type: Date, default: Date.now },
+});
+
+const SharedFile = mongoose.model('SharedFile', SharedFileSchema);
+
+// ----------------- YARDIMCI FONKSİYONLAR -----------------
+
 function hashPassword(password, salt = null) {
   salt = salt || crypto.randomBytes(16).toString('hex');
   const hash = crypto
@@ -191,20 +210,23 @@ app.delete('/delete_account/:userId', async (req, res) => {
     }
 
     await Note.deleteMany({ userId });
+    await SharedFile.deleteMany({
+      $or: [{ fromUserId: userId }, { toUserId: userId }],
+    });
     await User.findByIdAndDelete(userId);
 
     io.to(userId.toString()).emit('account_deleted');
 
-    res.send({ message: 'Hesap ve tüm notlar silindi' });
+    res.send({ message: 'Hesap ve tüm notlar/paylaşımlar silindi' });
   } catch (err) {
     console.error('Hesap silme hatası:', err);
     res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
 
-// ----------------- NOT / DOSYA -----------------
+// ----------------- NOT / DOSYA (KASA) -----------------
 
-// Not kaydetme
+// Not kaydetme (kasa)
 app.post('/save_note', async (req, res) => {
   try {
     const { userId, encryptedContent, iv, contentType, fileName, label } =
@@ -281,108 +303,128 @@ app.delete('/delete_note/:id', async (req, res) => {
   }
 });
 
-// ----------------- PAYLAŞIM -----------------
+// ----------------- PAYLAŞIM (KASA DIŞI) -----------------
 
-// Not paylaşma (kullanıcıya veya herkese açık kod)
-app.post('/share_note', async (req, res) => {
+// Dosya paylaşma (kullanıcıya veya kod ile)
+app.post('/share_file', async (req, res) => {
   try {
-    const { fromUserId, noteId, mode, targetUsername } = req.body;
+    const {
+      fromUserId,
+      mode, // 'direct' veya 'code'
+      targetUsername,
+      encryptedContent,
+      iv,
+      contentType,
+      fileName,
+    } = req.body;
 
-    if (!fromUserId || !noteId || !mode) {
-      return res
-        .status(400)
-        .send({ message: 'fromUserId, noteId ve mode zorunlu.' });
+    if (!fromUserId || !mode || !encryptedContent || !iv || !contentType) {
+      return res.status(400).send({ message: 'Zorunlu alanlar eksik.' });
     }
 
     const fromUser = await User.findById(fromUserId);
     if (!fromUser) {
-      return res
-        .status(404)
-        .send({ message: 'Gönderen kullanıcı bulunamadı.' });
-    }
-
-    const note = await Note.findOne({ _id: noteId, userId: fromUserId });
-    if (!note) {
-      return res.status(404).send({ message: 'Not bulunamadı.' });
+      return res.status(404).send({ message: 'Gönderen kullanıcı bulunamadı.' });
     }
 
     if (mode === 'direct') {
       if (!targetUsername) {
         return res
           .status(400)
-          .send({ message: 'targetUsername zorunlu (direct mod).' });
+          .send({ message: 'Direct paylaşım için targetUsername zorunlu.' });
       }
 
       const targetUser = await User.findOne({ username: targetUsername });
       if (!targetUser) {
-        return res
-          .status(404)
-          .send({ message: 'Hedef kullanıcı bulunamadı.' });
+        return res.status(404).send({ message: 'Hedef kullanıcı bulunamadı.' });
       }
 
-      const newNote = new Note({
-        userId: targetUser._id,
-        encryptedContent: note.encryptedContent,
-        iv: note.iv,
-        contentType: note.contentType,
-        fileName: note.fileName,
-        label: note.label,
-        sharedFrom: fromUser._id,
+      const shared = new SharedFile({
+        fromUserId: fromUser._id,
+        toUserId: targetUser._id,
+        mode: 'direct',
+        encryptedContent,
+        iv,
+        contentType,
+        fileName,
       });
 
-      await newNote.save();
+      await shared.save();
 
-      io.to(targetUser._id.toString()).emit('notes_updated');
+      io.to(targetUser._id.toString()).emit('inbox_updated');
 
       return res.status(201).send({ message: 'Dosya kullanıcıya gönderildi.' });
     }
 
-    if (mode === 'public') {
-      const code = crypto.randomBytes(4).toString('hex'); // 8 karakter
-      note.shareCode = code;
-      await note.save();
+    if (mode === 'code') {
+      const shareCode = crypto.randomBytes(4).toString('hex'); // 8 karakter
 
-      return res.status(200).send({
-        message: 'Paylaşım kodu oluşturuldu.',
-        code,
+      const shared = new SharedFile({
+        fromUserId: fromUser._id,
+        toUserId: null,
+        mode: 'code',
+        shareCode,
+        encryptedContent,
+        iv,
+        contentType,
+        fileName,
+      });
+
+      await shared.save();
+
+      return res.status(201).send({
+        message: 'Kod ile paylaşım oluşturuldu.',
+        code: shareCode,
       });
     }
 
     return res.status(400).send({ message: 'Geçersiz mode.' });
   } catch (err) {
-    console.error('Paylaşım hatası:', err);
+    console.error('share_file hatası:', err);
     res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
 
-// Kod ile paylaşılan notu bulma
-app.get('/search_shared/:code', async (req, res) => {
+// Kullanıcıya gelen paylaşımlar (gelen kutusu)
+app.get('/inbox/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const items = await SharedFile.find({ toUserId: userId })
+      .sort({ createdAt: -1 })
+      .populate('fromUserId', 'username fullName');
+
+    res.send({ items });
+  } catch (err) {
+    console.error('inbox hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
+  }
+});
+
+// Kod ile paylaşılan dosyayı bulma
+app.get('/shared_by_code/:code', async (req, res) => {
   try {
     const { code } = req.params;
-
     if (!code) {
       return res.status(400).send({ message: 'Kod zorunlu.' });
     }
 
-    const note = await Note.findOne({ shareCode: code });
-    if (!note) {
+    const shared = await SharedFile.findOne({ shareCode: code });
+    if (!shared) {
       return res.status(404).send({ message: 'Bu koda ait paylaşım yok.' });
     }
 
     res.send({
-      note: {
-        _id: note._id,
-        userId: note.userId,
-        encryptedContent: note.encryptedContent,
-        iv: note.iv,
-        contentType: note.contentType,
-        fileName: note.fileName,
-        label: note.label,
-        createdAt: note.createdAt,
+      item: {
+        encryptedContent: shared.encryptedContent,
+        iv: shared.iv,
+        contentType: shared.contentType,
+        fileName: shared.fileName,
+        createdAt: shared.createdAt,
       },
     });
   } catch (err) {
-    console.error('Kod ile arama hatası:', err);
+    console.error('shared_by_code hatası:', err);
     res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
