@@ -4,7 +4,6 @@ const express = require('express');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
 const cors = require('cors');
-const bodyParser = require('body-parser');
 const http = require('http');
 const { Server } = require('socket.io');
 
@@ -12,7 +11,6 @@ const app = express();
 
 // JSON limitleri
 app.use(express.json({ limit: '100mb' }));
-app.use(bodyParser.json({ limit: '100mb' }));
 app.use(cors());
 
 // HTTP + Socket.io
@@ -70,7 +68,7 @@ const NoteSchema = new mongoose.Schema({
   contentType: { type: String, required: true }, // image / video / pdf / text
   fileName: { type: String },
   label: { type: String, default: null },
-  isFavorite: { type: Boolean, default: false },
+  isFavorite: { type: Boolean, default: false }, // ⭐ favori
   createdAt: { type: Date, default: Date.now },
 
   // ileride lazım olabilir, dursun
@@ -91,8 +89,8 @@ const SharedFileSchema = new mongoose.Schema({
   iv: { type: String, required: true }, // şimdilik zorunlu alan, güvenlik için değil
   contentType: { type: String, required: true }, // image / video / pdf / file / text
   fileName: { type: String },
-  isRead: { type: Boolean, default: false },
-  expiresAt: { type: Date, default: null },
+  isRead: { type: Boolean, default: false }, // gelen kutusu okunma durumu
+  expiresAt: { type: Date, default: null },  // kod süresi
   createdAt: { type: Date, default: Date.now },
 });
 
@@ -102,16 +100,11 @@ const SharedFile = mongoose.model('SharedFile', SharedFileSchema);
 
 function hashPassword(password, salt = null) {
   salt = salt || crypto.randomBytes(16).toString('hex');
-  const hash = crypto.createHash('sha256').update(password + salt).digest('hex');
+  const hash = crypto
+    .createHash('sha256')
+    .update(password + salt)
+    .digest('hex');
   return { salt, hash };
-}
-
-async function generateUniqueShareCode() {
-  while (true) {
-    const code = crypto.randomBytes(4).toString('hex'); // 8 karakter
-    const exists = await SharedFile.exists({ shareCode: code });
-    if (!exists) return code;
-  }
 }
 
 // ----------------- AUTH -----------------
@@ -179,7 +172,7 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// Şifre değiştirme
+// Şifre değiştirme (salt değiştirmiyoruz, dosyalar bozulmasın)
 app.post('/change_password', async (req, res) => {
   try {
     const { userId, oldPassword, newPassword } = req.body;
@@ -198,7 +191,7 @@ app.post('/change_password', async (req, res) => {
       return res.status(401).send({ message: 'Eski şifre hatalı' });
     }
 
-    // 🔧 SALT DEĞİŞTİRMİYORUZ, AYNISINI KULLANIYORUZ -> Eski notlar bozulmasın
+    // Sadece hash'i güncelliyoruz, salt aynı kalıyor
     const { hash } = hashPassword(newPassword, user.salt);
     user.hash = hash;
     await user.save();
@@ -247,14 +240,12 @@ app.post('/save_note', async (req, res) => {
       return res.status(400).send({ message: 'Zorunlu alanlar eksik' });
     }
 
-    // İsteğe bağlı: boyut kontrolü (15MB civarı güvenli)
+    // Mongo 16MB limitine karşı basit kontrol (~15MB)
     const rawSizeBytes = Buffer.byteLength(encryptedContent, 'base64');
     const maxBytes = 15 * 1024 * 1024;
     if (rawSizeBytes > maxBytes) {
       return res.status(413).send({
-        message: `Dosya çok büyük. Maksimum ~${(maxBytes / (1024 * 1024)).toFixed(
-          1
-        )}MB`,
+        message: `Dosya çok büyük. Maksimum ~${(maxBytes / (1024 * 1024)).toFixed(1)}MB`,
       });
     }
 
@@ -325,25 +316,28 @@ app.delete('/delete_note/:id', async (req, res) => {
   }
 });
 
-// Not favori (tek not için)
-app.patch('/note_favorite/:id', async (req, res) => {
+// Notları favori yapma / favoriden çıkarma (çoklu)
+app.patch('/notes/favorite', async (req, res) => {
   try {
-    const { id } = req.params;
-    const { isFavorite } = req.body;
+    const { noteIds, isFavorite } = req.body;
 
-    const updated = await Note.findByIdAndUpdate(
-      id,
-      { isFavorite: !!isFavorite },
-      { new: true }
-    );
-
-    if (!updated) {
-      return res.status(404).send({ message: 'Not bulunamadı.' });
+    if (!Array.isArray(noteIds) || typeof isFavorite !== 'boolean') {
+      return res
+        .status(400)
+        .send({ message: 'noteIds (array) ve isFavorite (boolean) zorunlu.' });
     }
 
-    res.send({ message: 'Favori durumu güncellendi.' });
+    const result = await Note.updateMany(
+      { _id: { $in: noteIds } },
+      { $set: { isFavorite } }
+    );
+
+    res.send({
+      message: 'Güncellendi',
+      modifiedCount: result.modifiedCount,
+    });
   } catch (err) {
-    console.error('note_favorite hatası:', err);
+    console.error('notes/favorite hatası:', err);
     res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
@@ -361,7 +355,7 @@ app.post('/share_file', async (req, res) => {
       iv,
       contentType,
       fileName,
-      expiresInHours,
+      expiresInHours, // sadece code için kullanılacak
     } = req.body;
 
     if (!fromUserId || !mode || !encryptedContent || !iv || !contentType) {
@@ -373,14 +367,12 @@ app.post('/share_file', async (req, res) => {
       return res.status(404).send({ message: 'Gönderen kullanıcı bulunamadı.' });
     }
 
-    // küçük boyut kontrolü (yaklaşık, base64)
+    // Boyut kontrolü (yeniden, bu koleksiyon için de)
     const rawSizeBytes = Buffer.byteLength(encryptedContent, 'base64');
     const maxBytes = 15 * 1024 * 1024;
     if (rawSizeBytes > maxBytes) {
       return res.status(413).send({
-        message: `Dosya çok büyük. Maksimum ~${(maxBytes / (1024 * 1024)).toFixed(
-          1
-        )}MB`,
+        message: `Dosya çok büyük. Maksimum ~${(maxBytes / (1024 * 1024)).toFixed(1)}MB`,
       });
     }
 
@@ -416,11 +408,12 @@ app.post('/share_file', async (req, res) => {
 
     // 2) Kod ile paylaşım
     if (mode === 'code') {
-      const shareCode = await generateUniqueShareCode(); // çakışma kontrolü
+      const shareCode = crypto.randomBytes(4).toString('hex'); // 8 karakter
 
       let expiresAt = null;
       if (expiresInHours && Number(expiresInHours) > 0) {
-        expiresAt = new Date(Date.now() + Number(expiresInHours) * 60 * 60 * 1000);
+        const hours = Number(expiresInHours);
+        expiresAt = new Date(Date.now() + hours * 60 * 60 * 1000);
       }
 
       const shared = new SharedFile({
@@ -466,32 +459,6 @@ app.get('/inbox/:userId', async (req, res) => {
   }
 });
 
-// Gelen dosyayı "okundu" işaretleme
-app.post('/inbox_item/:id/read', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const updated = await SharedFile.findByIdAndUpdate(
-      id,
-      { isRead: true },
-      { new: true }
-    );
-
-    if (!updated) {
-      return res.status(404).send({ message: 'Gelen dosya bulunamadı.' });
-    }
-
-    if (updated.toUserId) {
-      io.to(updated.toUserId.toString()).emit('inbox_updated');
-    }
-
-    res.send({ message: 'Okundu olarak işaretlendi.' });
-  } catch (err) {
-    console.error('inbox_item read hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
 // Kod ile paylaşılan dosyayı bulma
 app.get('/shared_by_code/:code', async (req, res) => {
   try {
@@ -505,8 +472,9 @@ app.get('/shared_by_code/:code', async (req, res) => {
       return res.status(404).send({ message: 'Bu koda ait paylaşım yok.' });
     }
 
+    // Süresi dolmuş mu?
     if (shared.expiresAt && shared.expiresAt < new Date()) {
-      return res.status(410).send({ message: 'Bu paylaşımın süresi dolmuş.' });
+      return res.status(404).send({ message: 'Bu paylaşımın süresi dolmuş.' });
     }
 
     res.send({
@@ -526,7 +494,7 @@ app.get('/shared_by_code/:code', async (req, res) => {
 });
 
 // Paylaşım geçmişi (benim paylaştıklarım)
-app.get('/my_shares/:userId', async (req, res) => {
+app.get('/shared_by_me/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
 
@@ -536,7 +504,7 @@ app.get('/my_shares/:userId', async (req, res) => {
 
     res.send({ items });
   } catch (err) {
-    console.error('my_shares hatası:', err);
+    console.error('shared_by_me hatası:', err);
     res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
@@ -558,6 +526,32 @@ app.delete('/inbox_item/:id', async (req, res) => {
     res.send({ message: 'Gelen dosya silindi.' });
   } catch (err) {
     console.error('inbox_item silme hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
+  }
+});
+
+// Gelen dosyayı okundu olarak işaretleme
+app.patch('/inbox_item/:id/read', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const updated = await SharedFile.findByIdAndUpdate(
+      id,
+      { isRead: true },
+      { new: true }
+    );
+
+    if (!updated) {
+      return res.status(404).send({ message: 'Gelen dosya bulunamadı.' });
+    }
+
+    if (updated.toUserId) {
+      io.to(updated.toUserId.toString()).emit('inbox_updated');
+    }
+
+    res.send({ message: 'Okundu olarak işaretlendi.' });
+  } catch (err) {
+    console.error('inbox_item read hatası:', err);
     res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
