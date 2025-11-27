@@ -10,6 +10,7 @@ const { Server } = require('socket.io');
 
 const app = express();
 
+// JSON limitleri
 app.use(express.json({ limit: '100mb' }));
 app.use(bodyParser.json({ limit: '100mb' }));
 app.use(cors());
@@ -23,7 +24,8 @@ const io = new Server(server, {
   },
 });
 
-// Socket bağlantısı
+// ----------------- SOCKET.IO -----------------
+
 io.on('connection', (socket) => {
   console.log('🔌 Yeni bir client bağlandı:', socket.id);
 
@@ -38,7 +40,8 @@ io.on('connection', (socket) => {
   });
 });
 
-// MongoDB
+// ----------------- MONGODB -----------------
+
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => console.log('✅ MongoDB bağlantısı başarılı'))
@@ -59,7 +62,7 @@ const UserSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', UserSchema);
 
-// Note şeması (kasa için)
+// Kasa için not/dosya şeması
 const NoteSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   encryptedContent: { type: String, required: true },
@@ -69,7 +72,7 @@ const NoteSchema = new mongoose.Schema({
   label: { type: String, default: null },
   createdAt: { type: Date, default: Date.now },
 
-  // eski paylaşım denemelerinden kalmış olabilir, dursun zararı yok
+  // ileride lazım olabilir, dursun
   sharedFrom: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
   shareCode: { type: String, default: null },
 });
@@ -83,9 +86,9 @@ const SharedFileSchema = new mongoose.Schema({
   mode: { type: String, enum: ['direct', 'code'], required: true },
 
   shareCode: { type: String, default: null }, // code modunda kullanılacak kod
-  encryptedContent: { type: String, required: true }, // shareKey ile şifrelenmiş base64
-  iv: { type: String, required: true },
-  contentType: { type: String, required: true }, // image / video / pdf / file
+  encryptedContent: { type: String, required: true }, // burada aslında düz base64 içerik
+  iv: { type: String, required: true }, // şimdilik zorunlu alan, güvenlik için değil
+  contentType: { type: String, required: true }, // image / video / pdf / file / text
   fileName: { type: String },
   createdAt: { type: Date, default: Date.now },
 });
@@ -224,9 +227,9 @@ app.delete('/delete_account/:userId', async (req, res) => {
   }
 });
 
-// ----------------- NOT / DOSYA (KASA) -----------------
+// ----------------- KASA (NOT / DOSYA) -----------------
 
-// Not kaydetme (kasa)
+// Not / dosya kaydetme (kasa)
 app.post('/save_note', async (req, res) => {
   try {
     const { userId, encryptedContent, iv, contentType, fileName, label } =
@@ -327,6 +330,7 @@ app.post('/share_file', async (req, res) => {
       return res.status(404).send({ message: 'Gönderen kullanıcı bulunamadı.' });
     }
 
+    // 1) Kullanıcıya direkt gönder
     if (mode === 'direct') {
       if (!targetUsername) {
         return res
@@ -356,6 +360,7 @@ app.post('/share_file', async (req, res) => {
       return res.status(201).send({ message: 'Dosya kullanıcıya gönderildi.' });
     }
 
+    // 2) Kod ile paylaşım
     if (mode === 'code') {
       const shareCode = crypto.randomBytes(4).toString('hex'); // 8 karakter
 
@@ -416,6 +421,7 @@ app.get('/shared_by_code/:code', async (req, res) => {
 
     res.send({
       item: {
+        _id: shared._id,
         encryptedContent: shared.encryptedContent,
         iv: shared.iv,
         contentType: shared.contentType,
@@ -425,6 +431,27 @@ app.get('/shared_by_code/:code', async (req, res) => {
     });
   } catch (err) {
     console.error('shared_by_code hatası:', err);
+    res.status(500).send({ message: 'Sunucu hatası' });
+  }
+});
+
+// Gelen kutusundaki paylaşılan dosyayı silme
+app.delete('/inbox_item/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const deleted = await SharedFile.findByIdAndDelete(id);
+    if (!deleted) {
+      return res.status(404).send({ message: 'Gelen dosya bulunamadı.' });
+    }
+
+    if (deleted.toUserId) {
+      io.to(deleted.toUserId.toString()).emit('inbox_updated');
+    }
+
+    res.send({ message: 'Gelen dosya silindi.' });
+  } catch (err) {
+    console.error('inbox_item silme hatası:', err);
     res.status(500).send({ message: 'Sunucu hatası' });
   }
 });
