@@ -17,10 +17,10 @@ app.use(express.json());
 
 // --- MONGODB BAĞLANTISI ---
 // Render Environment Variables kısmına MONGODB_URI eklemeyi unutma!
-const mongoURI = process.env.MONGODB_URI; 
+const mongoURI = process.env.MONGO_URI; 
 
 if (!mongoURI) {
-    console.error("HATA: MONGODB_URI tanımlanmamış!");
+    console.error("HATA: MONGO_URI tanımlanmamış!");
     process.exit(1);
 }
 
