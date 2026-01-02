@@ -502,3 +502,25 @@ app.get("/sent_items/:userId", async (req, res) => {
     res.status(500).json({ error: "Giden kutusu yüklenemedi." });
   }
 });
+// server.js - Reset Password Rotosu
+app.post("/reset_password", async (req, res) => {
+  const { username, recoveryWord, newPassword } = req.body;
+  try {
+    const user = await User.findOne({ username });
+    if (!user || user.recoveryWord !== recoveryWord) {
+      return res.status(401).json({ message: "Kullanıcı adı veya kurtarma kelimesi hatalı." });
+    }
+
+    // Şifreyi güncelle (Not: Yeni salt oluşturup şifreyi tekrar hash'lemelisin)
+    const newSalt = crypto.randomBytes(16).toString('hex');
+    const newHashedPassword = crypto.pbkdf2Sync(newPassword, newSalt, 1000, 64, 'sha512').toString('hex');
+    
+    user.password = newHashedPassword;
+    user.salt = newSalt;
+    await user.save();
+
+    res.json({ message: "Şifre güncellendi." });
+  } catch (error) {
+    res.status(500).json({ error: "İşlem başarısız." });
+  }
+});
