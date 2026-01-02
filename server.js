@@ -1,526 +1,188 @@
-// server.js
-require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const crypto = require('crypto');
-const cors = require('cors');
-const bodyParser = require('body-parser');
 const http = require('http');
 const { Server } = require('socket.io');
+const cors = require('cors');
 
 const app = express();
-
-// JSON limitleri
-app.use(express.json({ limit: '100mb' }));
-app.use(bodyParser.json({ limit: '100mb' }));
-app.use(cors());
-
-// HTTP + Socket.io
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST', 'DELETE', 'PUT'],
-  },
+    cors: { origin: "*" }
 });
 
-// ----------------- SOCKET.IO -----------------
+app.use(cors());
+app.use(express.json());
 
+// --- MONGODB BAĞLANTISI ---
+mongoose.connect('mongodb://localhost:27017/authenlock', {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+}).then(() => console.log("MongoDB Bağlantısı Başarılı"))
+  .catch(err => console.error("Bağlantı Hatası:", err));
+
+// --- MODELLER ---
+
+// Kullanıcı Modeli (recoveryWord eklendi)
+const userSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    fullName: { type: String, required: true },
+    password: { type: String, required: true },
+    salt: { type: String, required: true },
+    recoveryWord: { type: String, required: true } // Şifre kurtarma için kritik alan
+});
+const User = mongoose.model('User', userSchema);
+
+// Paylaşılan Dosya Modeli
+const sharedFileSchema = new mongoose.Schema({
+    fromUserId: mongoose.Schema.Types.ObjectId,
+    toUserId: mongoose.Schema.Types.ObjectId,
+    toUsername: String,
+    fileName: String,
+    contentType: String,
+    encryptedContent: String,
+    shareCode: { type: String, unique: true, sparse: true },
+    createdAt: { type: Date, default: Date.now }
+});
+const SharedFile = mongoose.model('SharedFile', sharedFileSchema);
+
+// --- SOCKET.IO AYARLARI ---
 io.on('connection', (socket) => {
-  console.log('🔌 Yeni bir client bağlandı:', socket.id);
-
-  socket.on('join', (userId) => {
-    if (!userId) return;
-    socket.join(userId);
-    console.log(`🟢 Kullanıcı odaya katıldı: userId=${userId}`);
-  });
-
-  socket.on('disconnect', () => {
-    console.log('❌ Client bağlantısı koptu:', socket.id);
-  });
-});
-
-// ----------------- MONGODB -----------------
-
-mongoose
-  .connect(process.env.MONGO_URI)
-  .then(() => console.log('✅ MongoDB bağlantısı başarılı'))
-  .catch((err) => {
-    console.error('❌ MongoDB bağlantı hatası:', err);
-    process.exit(1);
-  });
-
-// ----------------- MODELLER -----------------
-
-// User şeması
-const UserSchema = new mongoose.Schema({
-  username: { type: String, required: true, unique: true },
-  fullName: { type: String, required: true },
-  salt: { type: String, required: true },
-  hash: { type: String, required: true },
-});
-
-const User = mongoose.model('User', UserSchema);
-
-// Kasa için not/dosya şeması
-const NoteSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  encryptedContent: { type: String, required: true },
-  iv: { type: String, required: true },
-  contentType: { type: String, required: true }, // image / video / pdf / text
-  fileName: { type: String },
-  label: { type: String, default: null },
-  createdAt: { type: Date, default: Date.now },
-
-  // ileride lazım olabilir, dursun
-  sharedFrom: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
-  shareCode: { type: String, default: null },
-});
-
-const Note = mongoose.model('Note', NoteSchema);
-
-// Paylaşım için ayrı model (kasa dışı)
-const SharedFileSchema = new mongoose.Schema({
-  fromUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  toUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // direct ise dolu
-  mode: { type: String, enum: ['direct', 'code'], required: true },
-
-  shareCode: { type: String, default: null }, // code modunda kullanılacak kod
-  encryptedContent: { type: String, required: true }, // burada aslında düz base64 içerik
-  iv: { type: String, required: true }, // şimdilik zorunlu alan, güvenlik için değil
-  contentType: { type: String, required: true }, // image / video / pdf / file / text
-  fileName: { type: String },
-  createdAt: { type: Date, default: Date.now },
-});
-
-const SharedFile = mongoose.model('SharedFile', SharedFileSchema);
-
-// ----------------- YARDIMCI FONKSİYONLAR -----------------
-
-function hashPassword(password, salt = null) {
-  salt = salt || crypto.randomBytes(16).toString('hex');
-  const hash = crypto
-    .createHash('sha256')
-    .update(password + salt)
-    .digest('hex');
-  return { salt, hash };
-}
-
-// ----------------- AUTH -----------------
-
-// Kayıt
-app.post('/register', async (req, res) => {
-  try {
-    const { username, password, fullName } = req.body;
-
-    if (!username || !password || !fullName) {
-      return res.status(400).send({ message: 'Tüm alanlar zorunludur' });
-    }
-
-    const existingUser = await User.findOne({ username });
-    if (existingUser) {
-      return res.status(409).send({ message: 'Bu kullanıcı adı zaten kayıtlı' });
-    }
-
-    const { salt, hash } = hashPassword(password);
-
-    const user = new User({
-      username,
-      fullName,
-      salt,
-      hash,
+    socket.on('join', (userId) => {
+        socket.join(userId);
+        console.log(`Kullanıcı odaya katıldı: ${userId}`);
     });
-
-    await user.save();
-
-    res.status(201).send({ message: 'Kayıt başarılı' });
-  } catch (err) {
-    console.error('Kayıt hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
 });
 
-// Giriş
-app.post('/login', async (req, res) => {
-  try {
+// --- ROTALAR (ROUTES) ---
+
+// 1. KAYIT OLMA
+app.post("/register", async (req, res) => {
+    const { username, fullName, password, recoveryWord } = req.body;
+    try {
+        const existingUser = await User.findOne({ username });
+        if (existingUser) return res.status(400).json({ message: "Kullanıcı adı zaten alınmış." });
+
+        const salt = crypto.randomBytes(16).toString('hex');
+        const hashedPassword = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+
+        const newUser = new User({
+            username,
+            fullName,
+            password: hashedPassword,
+            salt,
+            recoveryWord // Kurtarma kelimesi kaydediliyor
+        });
+
+        await newUser.save();
+        res.status(201).json({ message: "Kayıt başarılı." });
+    } catch (err) {
+        res.status(500).json({ message: "Kayıt hatası." });
+    }
+});
+
+// 2. GİRİŞ YAPMA
+app.post("/login", async (req, res) => {
     const { username, password } = req.body;
+    try {
+        const user = await User.findOne({ username });
+        if (!user) return res.status(401).json({ message: "Hatalı kullanıcı adı veya şifre." });
 
-    if (!username || !password) {
-      return res.status(400).send({ message: 'Tüm alanlar zorunludur' });
+        const hash = crypto.pbkdf2Sync(password, user.salt, 1000, 64, 'sha512').toString('hex');
+        if (hash !== user.password) return res.status(401).json({ message: "Hatalı kullanıcı adı veya şifre." });
+
+        res.json({
+            userId: user._id,
+            fullName: user.fullName,
+            salt: user.salt
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Giriş hatası." });
     }
-
-    const user = await User.findOne({ username });
-    if (!user) {
-      return res.status(401).send({ message: 'Kullanıcı bulunamadı' });
-    }
-
-    const { hash } = hashPassword(password, user.salt);
-    if (hash !== user.hash) {
-      return res.status(401).send({ message: 'Şifre hatalı' });
-    }
-
-    res.send({
-      message: 'Giriş başarılı',
-      userId: user._id,
-      fullName: user.fullName,
-      salt: user.salt,
-    });
-  } catch (err) {
-    console.error('Giriş hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
 });
 
-// Şifre değiştirme
-app.post('/change_password', async (req, res) => {
-  try {
-    const { userId, oldPassword, newPassword } = req.body;
-
-    if (!userId || !oldPassword || !newPassword) {
-      return res.status(400).send({ message: 'Tüm alanlar zorunludur' });
-    }
-
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).send({ message: 'Kullanıcı bulunamadı' });
-    }
-
-    // Eski şifreyi mevcut salt ile doğrula
-    const { hash: oldHash } = hashPassword(oldPassword, user.salt);
-    if (oldHash !== user.hash) {
-      return res.status(401).send({ message: 'Eski şifre hatalı' });
-    }
-
-    // ÖNEMLİ: Salt DEĞİŞMİYOR, sadece yeni şifre ile hash güncelleniyor.
-    // Böylece salt sabit kalıyor, AES key formülü: sha256(yeniŞifre + eskiSalt)
-    const { hash } = hashPassword(newPassword, user.salt);
-    user.hash = hash;
-    await user.save();
-
-    res.send({ message: 'Şifre başarıyla değiştirildi' });
-  } catch (err) {
-    console.error('Şifre değiştirme hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// Hesap silme
-app.delete('/delete_account/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).send({ message: 'Kullanıcı bulunamadı' });
-    }
-
-    await Note.deleteMany({ userId });
-    await SharedFile.deleteMany({
-      $or: [{ fromUserId: userId }, { toUserId: userId }],
-    });
-    await User.findByIdAndDelete(userId);
-
-    io.to(userId.toString()).emit('account_deleted');
-
-    res.send({ message: 'Hesap ve tüm notlar/paylaşımlar silindi' });
-  } catch (err) {
-    console.error('Hesap silme hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// ----------------- KASA (NOT / DOSYA) -----------------
-
-// Not / dosya kaydetme (kasa)
-app.post('/save_note', async (req, res) => {
-  try {
-    const { userId, encryptedContent, iv, contentType, fileName, label } =
-      req.body;
-
-    if (!userId || !encryptedContent || !iv || !contentType) {
-      return res.status(400).send({ message: 'Zorunlu alanlar eksik' });
-    }
-
-    const note = new Note({
-      userId,
-      encryptedContent,
-      iv,
-      contentType,
-      fileName,
-      label,
-    });
-
-    await note.save();
-
-    io.to(userId.toString()).emit('notes_updated');
-
-    res.status(201).send({ message: 'Not kaydedildi', noteId: note._id });
-  } catch (err) {
-    console.error('Not kaydetme hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// Notları listeleme
-app.get('/get_notes/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    let { page = 1, limit = 1000 } = req.query;
-
-    page = parseInt(page);
-    limit = parseInt(limit);
-
-    const notes = await Note.find({ userId })
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit);
-
-    const total = await Note.countDocuments({ userId });
-
-    res.send({
-      notes,
-      total,
-      page,
-      limit,
-    });
-  } catch (err) {
-    console.error('Notları listeleme hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// Not güncelleme (yeniden şifreleme için)
-app.put('/update_note/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { userId, encryptedContent, iv } = req.body;
-
-    if (!userId || !encryptedContent || !iv) {
-      return res.status(400).send({ message: 'Zorunlu alanlar eksik' });
-    }
-
-    const note = await Note.findOneAndUpdate(
-      { _id: id, userId },
-      { encryptedContent, iv },
-      { new: true }
-    );
-
-    if (!note) {
-      return res.status(404).send({ message: 'Not bulunamadı' });
-    }
-
-    io.to(userId.toString()).emit('notes_updated');
-
-    res.send({ message: 'Not güncellendi' });
-  } catch (err) {
-    console.error('Not güncelleme hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// Not silme
-app.delete('/delete_note/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const deleted = await Note.findByIdAndDelete(id);
-    if (!deleted) {
-      return res.status(404).send({ message: 'Not bulunamadı' });
-    }
-
-    io.to(deleted.userId.toString()).emit('notes_updated');
-
-    res.send({ message: 'Not silindi' });
-  } catch (err) {
-    console.error('Not silme hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// ----------------- PAYLAŞIM (KASA DIŞI) -----------------
-
-// Dosya paylaşma (kullanıcıya veya kod ile)
-app.post('/share_file', async (req, res) => {
-  try {
-    const {
-      fromUserId,
-      mode, // 'direct' veya 'code'
-      targetUsername,
-      encryptedContent,
-      iv,
-      contentType,
-      fileName,
-    } = req.body;
-
-    if (!fromUserId || !mode || !encryptedContent || !iv || !contentType) {
-      return res.status(400).send({ message: 'Zorunlu alanlar eksik.' });
-    }
-
-    const fromUser = await User.findById(fromUserId);
-    if (!fromUser) {
-      return res.status(404).send({ message: 'Gönderen kullanıcı bulunamadı.' });
-    }
-
-    // 1) Kullanıcıya direkt gönder
-    if (mode === 'direct') {
-      if (!targetUsername) {
-        return res
-          .status(400)
-          .send({ message: 'Direct paylaşım için targetUsername zorunlu.' });
-      }
-
-      const targetUser = await User.findOne({ username: targetUsername });
-      if (!targetUser) {
-        return res.status(404).send({ message: 'Hedef kullanıcı bulunamadı.' });
-      }
-
-      const shared = new SharedFile({
-        fromUserId: fromUser._id,
-        toUserId: targetUser._id,
-        mode: 'direct',
-        encryptedContent,
-        iv,
-        contentType,
-        fileName,
-      });
-
-      await shared.save();
-
-      io.to(targetUser._id.toString()).emit('inbox_updated');
-
-      return res.status(201).send({ message: 'Dosya kullanıcıya gönderildi.' });
-    }
-
-    // 2) Kod ile paylaşım
-    if (mode === 'code') {
-      const shareCode = crypto.randomBytes(4).toString('hex'); // 8 karakter
-
-      const shared = new SharedFile({
-        fromUserId: fromUser._id,
-        toUserId: null,
-        mode: 'code',
-        shareCode,
-        encryptedContent,
-        iv,
-        contentType,
-        fileName,
-      });
-
-      await shared.save();
-
-      return res.status(201).send({
-        message: 'Kod ile paylaşım oluşturuldu.',
-        code: shareCode,
-      });
-    }
-
-    return res.status(400).send({ message: 'Geçersiz mode.' });
-  } catch (err) {
-    console.error('share_file hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// Kullanıcıya gelen paylaşımlar (gelen kutusu)
-app.get('/inbox/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const items = await SharedFile.find({ toUserId: userId })
-      .sort({ createdAt: -1 })
-      .populate('fromUserId', 'username fullName');
-
-    res.send({ items });
-  } catch (err) {
-    console.error('inbox hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// Kod ile paylaşılan dosyayı bulma
-app.get('/shared_by_code/:code', async (req, res) => {
-  try {
-    const { code } = req.params;
-    if (!code) {
-      return res.status(400).send({ message: 'Kod zorunlu.' });
-    }
-
-    const shared = await SharedFile.findOne({ shareCode: code });
-    if (!shared) {
-      return res.status(404).send({ message: 'Bu koda ait paylaşım yok.' });
-    }
-
-    res.send({
-      item: {
-        _id: shared._id,
-        encryptedContent: shared.encryptedContent,
-        iv: shared.iv,
-        contentType: shared.contentType,
-        fileName: shared.fileName,
-        createdAt: shared.createdAt,
-      },
-    });
-  } catch (err) {
-    console.error('shared_by_code hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// Gelen kutusundaki paylaşılan dosyayı silme
-app.delete('/inbox_item/:id', async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const deleted = await SharedFile.findByIdAndDelete(id);
-    if (!deleted) {
-      return res.status(404).send({ message: 'Gelen dosya bulunamadı.' });
-    }
-
-    if (deleted.toUserId) {
-      io.to(deleted.toUserId.toString()).emit('inbox_updated');
-    }
-
-    res.send({ message: 'Gelen dosya silindi.' });
-  } catch (err) {
-    console.error('inbox_item silme hatası:', err);
-    res.status(500).send({ message: 'Sunucu hatası' });
-  }
-});
-
-// ----------------- SUNUCU -----------------
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Sunucu çalışıyor: http://localhost:${PORT}`);
-});
-// Kullanıcının gönderdiği dosyaları getirir
-app.get("/sent_items/:userId", async (req, res) => {
-  try {
-    const items = await SharedFile.find({ fromUserId: req.params.userId }).sort({ createdAt: -1 });
-    res.json({ items });
-  } catch (error) {
-    res.status(500).json({ error: "Giden kutusu yüklenemedi." });
-  }
-});
-// server.js - Reset Password Rotosu
+// 3. ŞİFRE SIFIRLAMA (RECOVERY)
 app.post("/reset_password", async (req, res) => {
-  const { username, recoveryWord, newPassword } = req.body;
-  try {
-    const user = await User.findOne({ username });
-    if (!user || user.recoveryWord !== recoveryWord) {
-      return res.status(401).json({ message: "Kullanıcı adı veya kurtarma kelimesi hatalı." });
+    const { username, recoveryWord, newPassword } = req.body;
+    try {
+        const user = await User.findOne({ username });
+        if (!user || user.recoveryWord !== recoveryWord) {
+            return res.status(401).json({ message: "Kullanıcı adı veya kurtarma kelimesi yanlış!" });
+        }
+
+        // Yeni şifre için yeni salt ve hash oluşturuluyor
+        const newSalt = crypto.randomBytes(16).toString('hex');
+        const newHashedPassword = crypto.pbkdf2Sync(newPassword, newSalt, 1000, 64, 'sha512').toString('hex');
+
+        user.password = newHashedPassword;
+        user.salt = newSalt;
+        await user.save();
+
+        res.json({ message: "Şifre başarıyla güncellendi." });
+    } catch (err) {
+        res.status(500).json({ message: "Sıfırlama hatası." });
     }
+});
 
-    // Şifreyi güncelle (Not: Yeni salt oluşturup şifreyi tekrar hash'lemelisin)
-    const newSalt = crypto.randomBytes(16).toString('hex');
-    const newHashedPassword = crypto.pbkdf2Sync(newPassword, newSalt, 1000, 64, 'sha512').toString('hex');
-    
-    user.password = newHashedPassword;
-    user.salt = newSalt;
-    await user.save();
+// 4. GELEN KUTUSUNU GETİR
+app.get("/inbox/:userId", async (req, res) => {
+    try {
+        const items = await SharedFile.find({ toUserId: req.params.userId }).sort({ createdAt: -1 });
+        res.json({ items });
+    } catch (err) {
+        res.status(500).json({ error: "Gelen kutusu yüklenemedi." });
+    }
+});
 
-    res.json({ message: "Şifre güncellendi." });
-  } catch (error) {
-    res.status(500).json({ error: "İşlem başarısız." });
-  }
+// 5. GİDEN KUTUSUNU GETİR
+app.get("/sent_items/:userId", async (req, res) => {
+    try {
+        const items = await SharedFile.find({ fromUserId: req.params.userId }).sort({ createdAt: -1 });
+        res.json({ items });
+    } catch (err) {
+        res.status(500).json({ error: "Giden kutusu yüklenemedi." });
+    }
+});
+
+// 6. DOSYA/NOT GÖNDERME
+app.post("/send_note", async (req, res) => {
+    const { fromUserId, toUsername, fileName, encryptedContent, contentType } = req.body;
+    try {
+        const targetUser = await User.findOne({ username: toUsername });
+        if (!targetUser) return res.status(404).json({ message: "Alıcı bulunamadı." });
+
+        const newFile = new SharedFile({
+            fromUserId,
+            toUserId: targetUser._id,
+            toUsername,
+            fileName,
+            encryptedContent,
+            contentType
+        });
+
+        await newFile.save();
+        
+        // Socket.io ile alıcıya bildirim gönder (Sayaç anlık artacak)
+        io.to(targetUser._id.toString()).emit('inbox_updated');
+
+        res.status(201).json({ message: "Gönderildi." });
+    } catch (err) {
+        res.status(500).json({ error: "Gönderim hatası." });
+    }
+});
+
+// 7. GELEN KUTUSUNDAN SİLME
+app.delete("/inbox_item/:id", async (req, res) => {
+    try {
+        await SharedFile.findByIdAndDelete(req.params.id);
+        res.json({ message: "Silindi." });
+    } catch (err) {
+        res.status(500).json({ error: "Silme hatası." });
+    }
+});
+
+// --- SERVER BAŞLATMA ---
+const PORT = 3000;
+server.listen(PORT, () => {
+    console.log(`Sunucu ${PORT} portunda çalışıyor.`);
 });
