@@ -493,3 +493,12 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Sunucu çalışıyor: http://localhost:${PORT}`);
 });
+// Kullanıcının gönderdiği dosyaları getirir
+app.get("/sent_items/:userId", async (req, res) => {
+  try {
+    const items = await SharedFile.find({ fromUserId: req.params.userId }).sort({ createdAt: -1 });
+    res.json({ items });
+  } catch (error) {
+    res.status(500).json({ error: "Giden kutusu yüklenemedi." });
+  }
+});
