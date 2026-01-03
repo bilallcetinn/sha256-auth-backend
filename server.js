@@ -74,7 +74,6 @@ function isPasswordValid(p) {
   return /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,}$/.test(p);
 }
 
-// SHA256 + ITERATION (hocaya uygun)
 function hashPassword(password, salt, iterations = 100000) {
   let hash = password + salt;
   for (let i = 0; i < iterations; i++) {
@@ -85,18 +84,22 @@ function hashPassword(password, salt, iterations = 100000) {
 
 /* -------------------- AUTH -------------------- */
 app.post('/register', async (req, res) => {
-  const username = req.body.username.trim().toLowerCase();
-  const { password, fullName } = req.body;
+  try {
+    const username = req.body.username.trim().toLowerCase();
+    const { password, fullName } = req.body;
 
-  if (!isPasswordValid(password)) {
-    return res.status(400).send({ message: 'Şifre zayıf' });
+    if (!isPasswordValid(password)) {
+      return res.status(400).send({ message: 'Şifre zayıf' });
+    }
+
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = hashPassword(password, salt);
+
+    await new User({ username, fullName, salt, hash }).save();
+    res.send({ message: 'Kayıt başarılı' });
+  } catch (err) {
+    res.status(500).send({ message: 'Kayıt hatası' });
   }
-
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = hashPassword(password, salt);
-
-  await new User({ username, fullName, salt, hash }).save();
-  res.send({ message: 'Kayıt başarılı' });
 });
 
 app.post('/login', authLimiter, async (req, res) => {
@@ -112,7 +115,7 @@ app.post('/login', authLimiter, async (req, res) => {
   res.send({ userId: user._id, fullName: user.fullName, salt: user.salt });
 });
 
-/* -------------------- CHANGE PASSWORD (SALT SABİT) -------------------- */
+/* -------------------- CHANGE PASSWORD -------------------- */
 app.post('/change_password', authLimiter, async (req, res) => {
   const { userId, oldPassword, newPassword } = req.body;
 
@@ -128,7 +131,6 @@ app.post('/change_password', authLimiter, async (req, res) => {
     return res.status(401).send({ message: 'Eski şifre hatalı' });
   }
 
-  // SALT DEĞİŞMİYOR
   user.hash = hashPassword(newPassword, user.salt);
   await user.save();
 
@@ -138,47 +140,59 @@ app.post('/change_password', authLimiter, async (req, res) => {
 /* -------------------- DELETE ACCOUNT -------------------- */
 app.delete('/delete_account/:userId', async (req, res) => {
   const { userId } = req.params;
-
   await Note.deleteMany({ userId });
   await SharedFile.deleteMany({ $or: [{ fromUserId: userId }, { toUserId: userId }] });
   await User.findByIdAndDelete(userId);
-
   io.to(userId).emit('account_deleted');
   res.send({ message: 'Hesap silindi' });
 });
 
-/* -------------------- NOTES -------------------- */
+/* -------------------- NOTES (RESİM YÜKLEME DÜZENLENDİ) -------------------- */
 app.post('/save_note', async (req, res) => {
-  const note = await new Note(req.body).save();
-  io.to(req.body.userId).emit('notes_updated');
-  res.send({ noteId: note._id });
+  try {
+    const { userId, encryptedContent, iv, contentType, fileName, label } = req.body;
+
+    if (!userId || !encryptedContent || !iv || !contentType) {
+      return res.status(400).send({ success: false, message: 'Eksik alan' });
+    }
+
+    const newNote = new Note({
+      userId,
+      encryptedContent,
+      iv,
+      contentType,
+      fileName,
+      label
+    });
+
+    const note = await newNote.save();
+
+    // 1. Yanıtı hemen gönderiyoruz (Zaman aşımını önlemek için)
+    res.status(201).send({
+      success: true,
+      noteId: note._id,
+    });
+
+    // 2. Socket işlemini yanıt gönderildikten sonra arka planda yapıyoruz
+    setImmediate(() => {
+      io.to(userId.toString()).emit('notes_updated');
+    });
+
+  } catch (err) {
+    console.error('UPLOAD ERROR:', err);
+    if (!res.headersSent) {
+      res.status(500).send({ success: false, message: 'Upload failed' });
+    }
+  }
 });
 
 app.get('/get_notes/:userId', async (req, res) => {
-  const { userId } = req.params;
-  const page = parseInt(req.query.page || 1);
-  const limit = parseInt(req.query.limit || 1000);
-
-  const notes = await Note.find({ userId })
-    .sort({ createdAt: -1 })
-    .skip((page - 1) * limit)
-    .limit(limit);
-
-  const total = await Note.countDocuments({ userId });
-  res.send({ notes, total, page, limit });
-});
-
-app.put('/update_note/:id', async (req, res) => {
-  const { userId, encryptedContent, iv } = req.body;
-  const note = await Note.findOneAndUpdate(
-    { _id: req.params.id, userId },
-    { encryptedContent, iv },
-    { new: true }
-  );
-
-  if (!note) return res.status(404).send({ message: 'Not yok' });
-  io.to(userId).emit('notes_updated');
-  res.send({ message: 'Not güncellendi' });
+  try {
+    const notes = await Note.find({ userId: req.params.userId }).sort({ createdAt: -1 });
+    res.send({ notes });
+  } catch (err) {
+    res.status(500).send({ message: 'Hata' });
+  }
 });
 
 app.delete('/delete_note/:id', async (req, res) => {
@@ -193,6 +207,7 @@ app.post('/share_file', async (req, res) => {
 
   if (mode === 'direct') {
     const target = await User.findOne({ username: targetUsername.toLowerCase() });
+    if (!target) return res.status(404).send({ message: 'Alıcı bulunamadı' });
     await new SharedFile({ ...req.body, toUserId: target._id }).save();
     io.to(target._id.toString()).emit('inbox_updated');
     return res.send({ message: 'Gönderildi' });
@@ -209,14 +224,12 @@ app.post('/share_file', async (req, res) => {
   res.send({ code });
 });
 
-app.get('/shared_by_code/:code', async (req, res) => {
-  const item = await SharedFile.findOne({ shareCode: req.params.code });
-  if (!item || item.expiresAt < new Date()) {
-    return res.status(410).send({ message: 'Kod süresi dolmuş' });
-  }
-  res.send({ item });
+/* -------------------- SERVER (TIMEOUT EKLENDİ) -------------------- */
+const PORT = process.env.PORT || 3000;
+const runningServer = server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on ${PORT}`);
 });
 
-/* -------------------- SERVER -------------------- */
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on ${PORT}`));
+// Büyük dosyaların yüklenmesi için bekleme sürelerini artırıyoruz
+runningServer.timeout = 120000; // 2 dakika
+runningServer.keepAliveTimeout = 60000;
